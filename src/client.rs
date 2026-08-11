@@ -983,7 +983,121 @@ fn write_lines_to_buffer(buf: &mut ratatui::buffer::Buffer, lines: &[ratatui::te
                 } else {
                     x += 1;
                 }
+           }
+       }
+   }
+}
+
+/// 直接从 rows_v2 写 buffer，绕过 Vec<Line>/Vec<Span> 构建。
+/// 仅用于非 copy-mode 路径（无 gutter 需求）。
+/// 省掉每行 Vec<Span> 构建、Span/Line 分配、write_lines_to_buffer 二次遍历、padding String 分配。
+fn write_runs_to_buffer(
+    buf: &mut ratatui::buffer::Buffer,
+    rows: &[crate::layout::RowRunsJson],
+    inner: ratatui::layout::Rect,
+    dim_preds: bool,
+    active: bool,
+    alternate_screen: bool,
+    cursor_row: u16,
+    cursor_col: u16,
+) {
+    let bw = buf.area.width as usize;
+    let bx = buf.area.x as usize;
+    let by = buf.area.y as usize;
+    let inner_x = inner.x as usize;
+    let max_x = (inner.x + inner.width) as usize;
+    let mut utf8 = [0u8; 4];
+
+    for r in 0..inner.height.min(rows.len() as u16) {
+        let y = inner.y + r;
+        let row_base = (y as usize - by) * bw;
+        let mut x = inner_x;
+        let mut last_bg = Color::Reset;
+
+        for run in &rows[r as usize].runs {
+            if x >= max_x { break; }
+            let mut fg = map_color(&run.fg);
+            let bg = map_color(&run.bg);
+            last_bg = bg;
+            let c = (x - inner_x) as u16;
+            if active && dim_preds && !alternate_screen
+                && (r > cursor_row || (r == cursor_row && c >= cursor_col))
+            {
+                fg = dim_color(fg);
             }
+            let mut style = Style::default().fg(fg).bg(bg);
+            if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
+            if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
+            if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
+            if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
+            if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+            if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
+            if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+            let text: &str = if run.flags & 64 != 0 {
+                " "
+            } else if run.text.is_empty() {
+                " "
+            } else {
+                &run.text
+            };
+
+            // hyperlink（OSC 8）：低频，仅有 link 时收集文本
+            if let Some(uri) = &run.link {
+                let mut hl_text = String::new();
+                let mut tx = x;
+                for ch in text.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cw == 0 { hl_text.push(ch); continue; }
+                    if tx + cw > max_x { break; }
+                    hl_text.push(ch);
+                    tx += cw.max(1);
+                }
+                if !hl_text.is_empty() {
+                    frame_hyperlinks_push(HyperlinkRun {
+                        x: inner.x + (x - inner_x) as u16, y: inner.y + r,
+                        text: hl_text, uri: uri.clone(), style,
+                    });
+                }
+            }
+
+            // char-iter 直写 buffer（处理截断、组合字符、宽字符）
+            for ch in text.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w == 0 {
+                    if x > inner_x {
+                        let prev = row_base + (x - 1 - bx);
+                        if prev < buf.content.len() {
+                            let mut combined = buf.content[prev].symbol().to_string();
+                            combined.push(ch);
+                            buf.content[prev].set_symbol(&combined);
+                        }
+                    }
+                    continue;
+                }
+                if x >= max_x { break; }
+                let idx = row_base + (x - bx);
+                if idx >= buf.content.len() { break; }
+                let s = ch.encode_utf8(&mut utf8);
+                buf.content[idx].set_symbol(s).set_style(style);
+                if w == 2 && x + 1 < max_x {
+                    if idx + 1 < buf.content.len() {
+                        buf.content[idx + 1].reset();
+                    }
+                    x += 2;
+                } else {
+                    x += 1;
+                }
+            }
+        }
+
+        // padding：直接写空白 cell，不分配 String
+        let pad_style = Style::default().bg(last_bg);
+        while x < max_x {
+            let idx = row_base + (x - bx);
+            if idx < buf.content.len() {
+                buf.content[idx].set_symbol(" ").set_style(pad_style);
+            }
+            x += 1;
         }
     }
 }
@@ -1034,8 +1148,6 @@ pub fn render_layout_json(
             // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
             let inner = pane_content_inner(area, border_status, border_format);
-            // 预分配行数，减少重分配
-            let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
             let use_full_cells = *copy_mode && *active && !content.is_empty();
             // If the source pane is larger than the preview area, reflow
             // (word-wrap) the rows onto preview-width lines instead of
@@ -1054,6 +1166,19 @@ pub fn render_layout_json(
             } else {
                 rows_v2.as_slice()
             };
+            // 提前计算 gutter_w 和快速路径判断
+            let gutter_w: u16 = if *copy_mode && *active {
+                copy_ln.map(|cfg| crate::copy_line_numbers::gutter_width(cfg.mode, cfg.hsize, inner.height as usize) as u16).unwrap_or(0)
+            } else { 0 };
+            // 快速路径：非 copy-mode rows_v2，无 gutter，直接写 buffer 绕过 Vec<Line>
+            let fast_path = !use_full_cells && !rows_v2_eff.is_empty() && gutter_w == 0;
+            if fast_path {
+                f.render_widget(Clear, inner);
+                let buf = f.buffer_mut();
+                write_runs_to_buffer(buf, rows_v2_eff, inner, dim_preds, *active, *alternate_screen, *cursor_row, *cursor_col);
+            }
+            if !fast_path {
+            let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
             if use_full_cells || rows_v2_eff.is_empty() {
                 // 惰性解析 selection 高亮样式：仅在首次命中 in_selection 时解析，
                 // 避免每个 cell 都重新 parse "bg=yellow,fg=black" 字符串。
@@ -1204,13 +1329,6 @@ pub fn render_layout_json(
                     lines.push(Line::from(spans));
                 }
             }
-            // Copy-mode line-number gutter (#copy-mode-line-numbers). Prepend a
-            // right-aligned number column to each visible row; content shifts
-            // right and the rightmost columns clip, matching tmux's reduced
-            // content width. Only the active copy-mode pane shows the gutter.
-            let gutter_w: u16 = if *copy_mode && *active {
-                copy_ln.map(|cfg| crate::copy_line_numbers::gutter_width(cfg.mode, cfg.hsize, inner.height as usize) as u16).unwrap_or(0)
-            } else { 0 };
             if gutter_w > 0 {
                 if let Some(cfg) = copy_ln {
                     let oy = *scroll_offset;
@@ -1229,6 +1347,7 @@ pub fn render_layout_json(
             f.render_widget(Clear, inner);
             let buf = f.buffer_mut();
             write_lines_to_buffer(buf, &lines, inner);
+            } // !fast_path
 
             if *copy_mode && *active {
                 let label = "[copy mode]";
