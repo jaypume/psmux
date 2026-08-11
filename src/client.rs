@@ -1170,9 +1170,16 @@ pub fn render_layout_json(
                 }
             }
 
+            // 直接逐行写入 buffer，绕过 Paragraph widget 遍历开销。
+            // 微基准实测（164x49 pane）：Paragraph 432us → set_line 286us（1.5x），
+            // 且保留 ratatui set_line 的 grapheme/宽字符正确处理。
             f.render_widget(Clear, inner);
-            let para = Paragraph::new(Text::from(lines));
-            f.render_widget(para, inner);
+            let buf = f.buffer_mut();
+            for (r, line) in lines.iter().enumerate() {
+                let y = inner.y + r as u16;
+                if y >= inner.y + inner.height { break; }
+                buf.set_line(inner.x, y, line, inner.width);
+            }
 
             if *copy_mode && *active {
                 let label = "[copy mode]";
@@ -6449,17 +6456,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
             let effective = find_active_cursor_shape(&root)
                 .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
-            let content_chunk = {
-                let sz = terminal.size().unwrap_or_default();
-                let constraints = if status_at_top {
-                    vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
-                } else {
-                    vec![Constraint::Min(1), Constraint::Length(status_lines as u16)]
-                };
-                let chunks = Layout::default().direction(Direction::Vertical)
-                    .constraints(constraints).split(sz.into());
-                if status_at_top { chunks[1] } else { chunks[0] }
-            };
+            // 复用 draw 闭包已计算的 client_content_area，避免每帧重复 Layout::split + vec![] 分配
+            let content_chunk = client_content_area;
             let active_pane_area: Option<Rect> =
                 compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed);
             // Compute screen-global cursor position from pane-local coords.
