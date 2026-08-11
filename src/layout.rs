@@ -113,24 +113,30 @@ pub fn cycle_top_layout(app: &mut AppState) {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CellJson { pub text: String, pub fg: String, pub bg: String, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub dim: bool, pub blink: bool, pub hidden: bool, pub strikethrough: bool }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CellRunJson {
-    pub text: String,
-    pub fg: String,
-    pub bg: String,
-    pub flags: u8,
-    pub width: u16,
-    /// OSC 8 hyperlink URI for this run, if any (#361). Omitted from the JSON
-    /// when absent — links are rare, so the per-frame payload is unchanged for
-    /// normal output. The client re-emits OSC 8 around runs that carry it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link: Option<String>,
-}
+ #[derive(Serialize, Deserialize, Clone)]
+ pub struct CellRunJson {
+     #[serde(rename = "t")]
+     pub text: String,
+     #[serde(rename = "f")]
+     pub fg: String,
+     #[serde(rename = "b")]
+     pub bg: String,
+     #[serde(rename = "x")]
+     pub flags: u8,
+     #[serde(rename = "w")]
+     pub width: u16,
+     /// OSC 8 hyperlink URI for this run, if any (#361). Omitted from the JSON
+     /// when absent — links are rare, so the per-frame payload is unchanged for
+     /// normal output. The client re-emits OSC 8 around runs that carry it.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub link: Option<String>,
+ }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RowRunsJson {
-    pub runs: Vec<CellRunJson>,
-}
+ #[derive(Serialize, Deserialize, Clone)]
+ pub struct RowRunsJson {
+     #[serde(rename = "r")]
+     pub runs: Vec<CellRunJson>,
+ }
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
@@ -654,26 +660,28 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     }
 
     /// Append a `vt100::Color` as its JSON string value (**no** surrounding quotes).
-    fn push_color(c: vt100::Color, out: &mut String) {
-        match c {
-            vt100::Color::Default => out.push_str("default"),
-            vt100::Color::Idx(i) => {
-                let _ = std::fmt::Write::write_fmt(out, format_args!("idx:{}", i));
-            }
-            vt100::Color::Rgb(r, g, b) => {
-                let _ = std::fmt::Write::write_fmt(out, format_args!("rgb:{},{},{}", r, g, b));
-            }
-        }
-    }
+     fn push_color(c: vt100::Color, out: &mut String) {
+         match c {
+             // 空串编码 Default：每帧 ~900 次出现，省 7 字节/次。
+             // client 的 map_color("") 已映射到 Color::Reset。
+             vt100::Color::Default => {}
+             vt100::Color::Idx(i) => {
+                 let _ = std::fmt::Write::write_fmt(out, format_args!("idx:{}", i));
+             }
+             vt100::Color::Rgb(r, g, b) => {
+                 let _ = std::fmt::Write::write_fmt(out, format_args!("rgb:{},{},{}", r, g, b));
+             }
+         }
+     }
 
-    /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
-    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
-        out.push_str("\",\"fg\":\"");
-        push_color(fg, out);
-        out.push_str("\",\"bg\":\"");
-        push_color(bg, out);
-        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}}}", fl, w));
-    }
+     /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
+     fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
+         out.push_str("\",\"f\":\"");
+         push_color(fg, out);
+         out.push_str("\",\"b\":\"");
+         push_color(bg, out);
+         let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"x\":{},\"w\":{}}}", fl, w));
+     }
 
     // ── recursive tree walker ────────────────────────────────────────
 
@@ -1006,9 +1014,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                         // pad to full column width
                         let total_w: u16 = row.iter().map(|c| c.width).sum();
-                        for _ in total_w..p.last_cols {
-                            out.push_str(",{\"text\":\" \",\"fg\":\"default\",\"bg\":\"default\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false,\"blink\":false,\"hidden\":false,\"strikethrough\":false}");
-                        }
+                         for _ in total_w..p.last_cols {
+                             out.push_str(",{\"text\":\" \",\"fg\":\"\",\"bg\":\"\",\"bold\":false,\"italic\":false,\"underline\":false,\"inverse\":false,\"dim\":false,\"blink\":false,\"hidden\":false,\"strikethrough\":false}");
+                         }
                         out.push(']');
                     }
                     out.push_str("],");
@@ -1017,18 +1025,18 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 }
 
                 // ── rows_v2 (from snapshot, no mutex held) ───────────
-                out.push_str("\"rows_v2\":[");
+                 out.push_str("\"rows_v2\":[");
                  for (ri, row) in snap_rows.iter().enumerate() {
-                    if ri > 0 { out.push(','); }
-                    out.push_str("{\"runs\":[");
-                    for (i, run) in row.runs.iter().enumerate() {
-                        if i > 0 { out.push(','); }
-                        out.push_str("{\"text\":\"");
-                        json_esc(&run.text, out);
-                        close_run(run.fg, run.bg, run.flags, run.width, out);
-                    }
-                    out.push_str("]}");
-                }
+                     if ri > 0 { out.push(','); }
+                     out.push_str("{\"r\":[");
+                     for (i, run) in row.runs.iter().enumerate() {
+                         if i > 0 { out.push(','); }
+                         out.push_str("{\"t\":\"");
+                         json_esc(&run.text, out);
+                         close_run(run.fg, run.bg, run.flags, run.width, out);
+                     }
+                     out.push_str("]}");
+                 }
                 out.push_str("]");
                 // Append pane title if set
                 if !p.title.is_empty() {
