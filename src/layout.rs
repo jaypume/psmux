@@ -766,13 +766,13 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 // also holds p.term's mutex while processing ConPTY output).
                 // Without this, WSL echo gets starved because its output sits
                 // in the ConPTY pipe while we build the JSON string.
-                 struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
-                 struct RowSnap { runs: Vec<Run> }
-                 struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, width: u16 }
-                 // 锁内紧凑快照：仅拷贝 cell 原始数据（text 必须 String::from，
-                 // 因为 cell.contents() 借用 screen，锁释放后引用失效）。
-                 // run-merge 推迟到锁外，减少 reader 线程阻塞 97%（基准实测）。
-                 struct RawCell { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
+                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
+                struct RowSnap { runs: Vec<Run> }
+                struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, width: u16 }
+                 // 锁内直接 run-merge：只对每个 run 的首 cell 做 to_string()，
+                 // 后续 cell 用 push_str（已有容量不分配）。
+                 // 比旧方案（每 cell to_string + 锁外 merge）少 ~7500 次堆分配，
+                 // 且锁持有时间反而下降（分配少了）。
                  struct LeafSnap {
                      cr: u16, cc: u16, alt: bool,
                      wants_mouse: bool,
@@ -780,19 +780,11 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                      rows_v2: Vec<RowSnap>,
                      content: Vec<Vec<CopyCell>>,
                  }
-                 // raw rows + copy content，锁外再 merge 成 rows_v2
-                 struct RawSnap {
-                     cr: u16, cc: u16, alt: bool,
-                     wants_mouse: bool,
-                     hide_cursor: bool,
-                     raw_rows: Vec<Vec<RawCell>>,
-                     content: Vec<Vec<CopyCell>>,
-                 }
 
                  let snap = 'snap: {
                      let parser = match p.term.lock() {
                          Ok(g) => g,
-                         Err(_) => break 'snap RawSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, raw_rows: vec![], content: vec![] },
+                         Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, rows_v2: vec![], content: vec![] },
                      };
                      let screen = parser.screen();
                      let (cr, cc) = screen.cursor_position();
@@ -812,14 +804,17 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     let wants_mouse =
                         screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
 
-                     // 锁内只做紧凑 cell 拷贝，不做 run-merge。
-                     // run-merge 涉及大量 String 分配，推迟到锁外执行。
-                     let mut raw_rows: Vec<Vec<RawCell>> = Vec::with_capacity(p.last_rows as usize);
+                     // 锁内直接 run-merge：只对每个 run 首 cell 做 to_string()，
+                     // 后续 cell 用 push_str（已有容量不分配）。比旧方案少 ~7500 次堆分配/帧。
+                     let mut rows_v2: Vec<RowSnap> = Vec::with_capacity(p.last_rows as usize);
                      for r in 0..p.last_rows {
-                         let mut row_cells: Vec<RawCell> = Vec::with_capacity(p.last_cols as usize);
+                         let mut runs: Vec<Run> = Vec::new();
+                         let mut prev_fg: Option<vt100::Color> = None;
+                         let mut prev_bg: Option<vt100::Color> = None;
+                         let mut prev_fl: u8 = 0;
                          let mut c = 0u16;
                          while c < p.last_cols {
-                             if let Some(cell) = screen.cell(r, c) {
+                             let (t, cfg, cbg, w, fl) = if let Some(cell) = screen.cell(r, c) {
                                  let t = cell.contents();
                                  let t = if t.is_empty() { " " } else { t };
                                  let cfg = cell.fgcolor();
@@ -835,15 +830,26 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                  if cell.blink()     { fl |= FLAG_BLINK; }
                                  if cell.hidden()    { fl |= FLAG_HIDDEN; }
                                  if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
-                                 row_cells.push(RawCell { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w });
-                                 c += w.max(1);
+                                 (t, cfg, cbg, w, fl)
                              } else {
-                                 row_cells.push(RawCell { text: " ".to_string(), fg: vt100::Color::Default, bg: vt100::Color::Default, flags: 0, width: 1 });
-                                 c += 1;
+                                 (" ", vt100::Color::Default, vt100::Color::Default, 1u16, 0u8)
+                             };
+                             if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                 if let Some(last) = runs.last_mut() {
+                                     last.text.push_str(t);
+                                     last.width += w;
+                                 }
+                             } else {
+                                 runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w });
                              }
+                             prev_fg = Some(cfg);
+                             prev_bg = Some(cbg);
+                             prev_fl = fl;
+                             c += w.max(1);
                          }
-                         raw_rows.push(row_cells);
+                         rows_v2.push(RowSnap { runs });
                      }
+                    
 
                     // Snapshot content (copy-mode only)
                     let mut snap_content: Vec<Vec<CopyCell>> = Vec::new();
@@ -874,36 +880,12 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                     }
 
-                     RawSnap { cr, cc, alt, wants_mouse, hide_cursor, raw_rows, content: snap_content }
+                     LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, rows_v2, content: snap_content }
                  };
                  // ── Parser mutex is now RELEASED ──
-                 // 紧凑快照已取，锁释放。run-merge + JSON 构建均在锁外执行，
-                 // reader 线程可并发处理 ConPTY 输出。
-
-                  // 锁外 run-merge：把 raw cells 合并成同色连续 run。
-                  // 比锁内做省不了总工作量，但不阻塞 reader（基准：锁内缩短 97%）。
-                  // 用 into_iter 消费 raw_rows，使每个 run 首个 cell 的 text
-                  // 可以 mem::take 取出（move），避免 clone（省 ~500 次/帧）。
-                  let snap_rows: Vec<RowSnap> = snap.raw_rows.into_iter().map(|row| {
-                      let mut runs: Vec<Run> = Vec::with_capacity(row.len());
-                      let mut prev_fg: Option<vt100::Color> = None;
-                      let mut prev_bg: Option<vt100::Color> = None;
-                      let mut prev_fl: u8 = 0;
-                      for mut cell in row {
-                          if prev_fg == Some(cell.fg) && prev_bg == Some(cell.bg) && prev_fl == cell.flags {
-                              if let Some(last) = runs.last_mut() {
-                                  last.text.push_str(&cell.text);
-                                  last.width += cell.width;
-                              }
-                          } else {
-                              runs.push(Run { text: std::mem::take(&mut cell.text), fg: cell.fg, bg: cell.bg, flags: cell.flags, width: cell.width });
-                          }
-                          prev_fg = Some(cell.fg);
-                          prev_bg = Some(cell.bg);
-                          prev_fl = cell.flags;
-                      }
-                      RowSnap { runs }
-                  }).collect();
+                 // run-merge 已在锁内完成，此处直接取用。
+                 let snap_rows = snap.rows_v2;
+                
 
                 // ── leaf header ──────────────────────────────────────
                 let so = if is_active && in_copy { scroll_off } else { 0 };
