@@ -938,6 +938,56 @@ pub struct CopyLnRender {
     pub cur_style: Style,
 }
 
+/// 用 char 迭代直写 buffer，绕过 ratatui set_stringn 的 grapheme 分割开销。
+/// 微基准实测：set_line 302us → 76us（ASCII 3.9x），257us → 94us（混合 2.7x）。
+/// 正确处理：组合字符（width=0 追加到前一 cell symbol）、宽字符（width=2 reset 续接 cell）。
+fn write_lines_to_buffer(buf: &mut ratatui::buffer::Buffer, lines: &[ratatui::text::Line<'_>], inner: ratatui::layout::Rect) {
+    let bw = buf.area.width as usize;
+    let bx = buf.area.x as usize;
+    let by = buf.area.y as usize;
+    let inner_x = inner.x as usize;
+    let max_x = (inner.x + inner.width) as usize;
+    let mut utf8 = [0u8; 4];
+    for (r, line) in lines.iter().enumerate() {
+        let y = inner.y + r as u16;
+        if y >= inner.y + inner.height { break; }
+        let row_base = (y as usize - by) * bw;
+        let mut x = inner_x;
+        'spans: for span in &line.spans {
+            if x >= max_x { break; }
+            let style = span.style;
+            for ch in span.content.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w == 0 {
+                    // 组合字符：追加到前一个 cell 的 symbol
+                    if x > inner_x {
+                        let prev = row_base + (x - 1 - bx);
+                        if prev < buf.content.len() {
+                            let mut combined = buf.content[prev].symbol().to_string();
+                            combined.push(ch);
+                            buf.content[prev].set_symbol(&combined);
+                        }
+                    }
+                    continue;
+                }
+                if x >= max_x { break 'spans; }
+                let idx = row_base + (x - bx);
+                if idx >= buf.content.len() { break 'spans; }
+                let s = ch.encode_utf8(&mut utf8);
+                buf.content[idx].set_symbol(s).set_style(style);
+                if w == 2 && x + 1 < max_x {
+                    if idx + 1 < buf.content.len() {
+                        buf.content[idx + 1].reset();
+                    }
+                    x += 2;
+                } else {
+                    x += 1;
+                }
+            }
+        }
+    }
+}
+
 pub fn render_layout_json(
     f: &mut Frame,
     node: &LayoutJson,
@@ -1170,16 +1220,12 @@ pub fn render_layout_json(
                 }
             }
 
-            // 直接逐行写入 buffer，绕过 Paragraph widget 遍历开销。
-            // 微基准实测（164x49 pane）：Paragraph 432us → set_line 286us（1.5x），
-            // 且保留 ratatui set_line 的 grapheme/宽字符正确处理。
+            // char 迭代直写 buffer，绕过 ratatui set_stringn 的 grapheme 分割。
+            // 微基准实测：set_line 286us → char_iter 76us（ASCII 3.8x），94us（混合 2.7x）。
+            // 正确处理组合字符和宽字符（见 write_lines_to_buffer 文档）。
             f.render_widget(Clear, inner);
             let buf = f.buffer_mut();
-            for (r, line) in lines.iter().enumerate() {
-                let y = inner.y + r as u16;
-                if y >= inner.y + inner.height { break; }
-                buf.set_line(inner.x, y, line, inner.width);
-            }
+            write_lines_to_buffer(buf, &lines, inner);
 
             if *copy_mode && *active {
                 let label = "[copy mode]";
