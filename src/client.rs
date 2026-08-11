@@ -1004,6 +1004,9 @@ pub fn render_layout_json(
                 rows_v2.as_slice()
             };
             if use_full_cells || rows_v2_eff.is_empty() {
+                // 惰性解析 selection 高亮样式：仅在首次命中 in_selection 时解析，
+                // 避免每个 cell 都重新 parse "bg=yellow,fg=black" 字符串。
+                let mut selection_style: Option<Style> = None;
                 for r in 0..inner.height.min(content.len() as u16) {
                     let mut spans: Vec<Span> = Vec::new();
                     let row = &content[r as usize];
@@ -1040,8 +1043,8 @@ pub fn render_layout_json(
                         }
                         let mut style = Style::default().fg(fg).bg(bg);
                         if in_selection {
-                            let ms = crate::rendering::parse_tmux_style(mode_style_str);
-                            style = ms;
+                            style = *selection_style.get_or_insert_with(
+                                || crate::rendering::parse_tmux_style(mode_style_str));
                         }
                         if cell.inverse { style = style.add_modifier(Modifier::REVERSED); }
                         if cell.dim { style = style.add_modifier(Modifier::DIM); }
@@ -2041,6 +2044,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
     let mut client_pane_rects: Vec<(usize, Rect)> = Vec::new();
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
+    // 跨帧复用的 border 路径栈（collect_layout_borders 的递归工作缓冲）。
+    let mut border_path: Vec<usize> = Vec::new();
     let mut client_content_area: Rect = Rect::default();
     // Border status/format from the last draw, for cursor/mouse inner-rect calc.
     let mut client_border_status: String = "off".to_string();
@@ -5105,7 +5110,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             client_pane_rects.clear();
             collect_pane_rects(&root, content_chunk, &mut client_pane_rects);
             client_borders.clear();
-            let mut border_path = Vec::new();
+            border_path.clear();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
 
             let active_rect = compute_active_rect_json_zoom_aware(&root, content_chunk, state.zoomed);
@@ -5119,8 +5124,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 _ => "#{pane_index} \"#{pane_title}\"",
             };
             // Publish for the post-draw cursor and next frame's mouse handlers.
-            client_border_status = border_status.to_string();
-            client_border_format = border_format.to_string();
+            // 复用已有 String 容量，避免每帧 to_string 重新分配。
+            client_border_status.clear();
+            client_border_status.push_str(border_status);
+            client_border_format.clear();
+            client_border_format.push_str(border_format);
             // O(N) per frame but pane counts are small in practice (typically < 20).
             let total_panes = if state.zoomed { 1 } else { root.count_leaves() };
             let bchars = crate::border_lines::border_chars(

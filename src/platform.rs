@@ -3416,6 +3416,16 @@ pub struct Utf16ConsoleWriter {
 #[cfg(windows)]
 unsafe impl Send for Utf16ConsoleWriter {}
 
+// 跨帧复用的 UTF-16 编码缓冲区（约 128KB）。write_wide 把 UTF-8 帧编码
+// 成 UTF-16 写入 WriteConsoleW，这里复用容量避免每帧分配数万个 u16。
+// 用 thread_local 是因为 flush() 调用 write_wide 时 `s` 仍借用
+// self.frame_buf，无法同时 &mut self 的另一字段。
+#[cfg(windows)]
+thread_local! {
+    static WIDE_CONSOLE_BUF: std::cell::RefCell<Vec<u16>> =
+        std::cell::RefCell::new(Vec::with_capacity(131072));
+}
+
 #[cfg(windows)]
 impl Utf16ConsoleWriter {
     pub fn new() -> Self {
@@ -3435,7 +3445,11 @@ impl Utf16ConsoleWriter {
             || unsafe { GetConsoleMode(handle, &mut mode) } == 0;
         // Pre-allocate ~128KB for the frame buffer — large enough for a
         // typical full-screen frame's escape sequences without reallocation.
-        Self { handle, pipe_output, frame_buf: Vec::with_capacity(131072) }
+        Self {
+            handle,
+            pipe_output,
+            frame_buf: Vec::with_capacity(131072),
+        }
     }
 
     /// Write raw UTF-8 bytes via `WriteFile` — the output path when stdout is
@@ -3494,29 +3508,37 @@ impl Utf16ConsoleWriter {
             ) -> i32;
         }
 
-        let wide: Vec<u16> = s.encode_utf16().collect();
-        let mut total: u32 = 0;
-        let len = wide.len() as u32;
-        while total < len {
-            let mut written: u32 = 0;
-            let ok = unsafe {
-                WriteConsoleW(
-                    self.handle,
-                    wide.as_ptr().add(total as usize),
-                    len - total,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
+        // 复用 thread-local 的 UTF-16 缓冲区。用 thread_local 而非 self 字段：
+        // flush() 调用 write_wide 时 `s` 仍借用 self.frame_buf，无法同时
+        // &mut self 的另一字段；thread_local 绕过该限制且跨帧复用容量，
+        // 避免每帧分配数万个 u16。
+        WIDE_CONSOLE_BUF.with(|cell| {
+            let wide = &mut *cell.borrow_mut();
+            wide.clear();
+            wide.extend(s.encode_utf16());
+            let len = wide.len() as u32;
+            let mut total: u32 = 0;
+            while total < len {
+                let mut written: u32 = 0;
+                let ok = unsafe {
+                    WriteConsoleW(
+                        self.handle,
+                        wide.as_ptr().add(total as usize),
+                        len - total,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if written == 0 {
+                    break;
+                }
+                total += written;
             }
-            if written == 0 {
-                break;
-            }
-            total += written;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -3761,15 +3783,16 @@ impl std::io::Write for Utf16ConsoleWriter {
             }
         }
 
-        // Rebuild the frame buffer: any pending UTF-8 tail first, then the
-        // deferred incomplete escape sequence.
+        // 保留少量尾部字节（不完整 UTF-8 尾 + 未完成的转义序列），复用
+        // frame_buf 已有的容量，避免每帧丢弃 128KB 缓冲再重新增长。
         let utf8_tail_start = processed.len() - remainder;
-        let mut next = Vec::with_capacity(remainder + deferred.len());
+        let mut tail: Vec<u8> = Vec::with_capacity(remainder + deferred.len());
         if remainder > 0 {
-            next.extend_from_slice(&processed[utf8_tail_start..]);
+            tail.extend_from_slice(&processed[utf8_tail_start..]);
         }
-        next.extend_from_slice(deferred);
-        self.frame_buf = next;
+        tail.extend_from_slice(deferred);
+        self.frame_buf.clear();
+        self.frame_buf.extend_from_slice(&tail);
 
         Ok(())
     }

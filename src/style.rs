@@ -17,6 +17,12 @@ use crate::debug_log::style_log;
 /// `idx:N`, `rgb:R,G,B`, and `default`/`terminal`.
 pub fn map_color(name: &str) -> Color {
     let name = name.trim();
+    // 快速路径：最常见值直接返回，避免下方 to_ascii_lowercase 分配。
+    // server 序列化的 cell 颜色绝大多数是 "default"。
+    match name {
+        "default" | "terminal" | "" => return Color::Reset,
+        _ => {}
+    }
     // idx:N (psmux custom)
     if let Some(idx_str) = name.strip_prefix("idx:") {
         if let Ok(idx) = idx_str.parse::<u8>() {
@@ -25,11 +31,15 @@ pub fn map_color(name: &str) -> Color {
     }
     // rgb:R,G,B (psmux custom)
     if let Some(rgb_str) = name.strip_prefix("rgb:") {
-        let parts: Vec<&str> = rgb_str.split(',').collect();
-        if parts.len() == 3 {
-            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
-                return Color::Rgb(r, g, b);
+        // 手动解析避免 Vec 分配：正好 3 段，无多余段。
+        let mut it = rgb_str.split(',');
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(r), Some(g), Some(b), None) => {
+                if let (Ok(r), Ok(g), Ok(b)) = (r.parse::<u8>(), g.parse::<u8>(), b.parse::<u8>()) {
+                    return Color::Rgb(r, g, b);
+                }
             }
+            _ => {}
         }
     }
     // #RRGGBB hex
@@ -45,7 +55,8 @@ pub fn map_color(name: &str) -> Color {
         }
     }
     // colour0-colour255 / color0-color255 (tmux primary indexed color format)
-    let lower = name.to_lowercase();
+    // 该分支主要用于用户配置的颜色（非每帧 cell 热路径），到达此处才小写化。
+    let lower = name.to_ascii_lowercase();
     if let Some(idx_str) = lower.strip_prefix("colour").or_else(|| lower.strip_prefix("color")) {
         if let Ok(idx) = idx_str.parse::<u8>() {
             return Color::Indexed(idx);
