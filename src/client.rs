@@ -6522,6 +6522,30 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
             }
 
+            // Set cursor position inside the draw closure so ratatui
+            // emits ?25h + CUP as part of its batched frame_buf flush,
+            // eliminating the cursor hide (?25l) then show (?25h) gap
+            // that caused flicker (old code wrote ?25h via a separate
+            // stdout write after ratatui already flushed ?25l).
+            {
+                let cur_pos = if srv_popup_active && srv_popup_has_pty {
+                    srv_popup_cursor.and_then(|c| {
+                        popup_cursor_screen_pos(content_chunk, srv_popup_width,
+                            srv_popup_height, srv_popup_scroll, c)
+                    })
+                } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_rect) {
+                    let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
+                    let cy = inner.y + cr.min(inner.height.saturating_sub(1));
+                    let cx = inner.x + cc.min(inner.width.saturating_sub(1));
+                    Some((cx, cy))
+                } else {
+                    None
+                };
+                if let Some((cx, cy)) = cur_pos {
+                    f.set_cursor_position(ratatui::layout::Position { x: cx, y: cy });
+                }
+            }
+
         })?;
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
@@ -6673,16 +6697,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             } else {
                 None
             };
-            // Build a single VT string with: ?25h + CUP + DECSCUSR
-            // ratatui's draw() always emits ?25l (since we never call
-             // f.set_cursor_position), so we must re-emit ?25h + CUP
-             // every frame when the cursor should be visible.
+            // DECSCUSR only - cursor visibility + position now handled by
+            // f.set_cursor_position() inside the draw closure (above), so
+            // ?25h + CUP go into ratatui's batched frame_buf flush.
              cursor_buf.clear();
-             if let Some((cx, cy)) = cursor_visible {
-                 cursor_buf.push_str("\x1b[?25h");
-                 use std::fmt::Write as FmtWrite;
-                 let _ = write!(cursor_buf, "\x1b[{};{}H", cy + 1, cx + 1);
-             }
              // DECSCUSR only when style actually changes (avoids blink
              // timer resets in WT).
              if effective != last_cursor_style {
