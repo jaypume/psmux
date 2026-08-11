@@ -862,10 +862,12 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                              let (t, cfg, cbg, w, fl) = if let Some(cell) = screen.cell(r, c) {
                                  let t = cell.contents();
                                  let t = if t.is_empty() { " " } else { t };
-                                 let cfg = cell.fgcolor();
-                                 let cbg = cell.bgcolor();
-                                 let mut w = UnicodeWidthStr::width(t) as u16;
-                                 if w == 0 { w = 1; }
+                                let cfg = cell.fgcolor();
+                                let cbg = cell.bgcolor();
+                                // ASCII 快速路径：单字节字符 width 最终都是 1（下方 w==0 兜底），
+                                // 省去 ~7000 次/帧的 UnicodeWidthStr::width 查表
+                                let mut w = if t.len() == 1 { 1u16 } else { UnicodeWidthStr::width(t) as u16 };
+                                if w == 0 { w = 1; }
                                  let mut fl = 0u8;
                                  if cell.dim()   { fl |= FLAG_DIM; }
                                  if cell.bold()  { fl |= FLAG_BOLD; }

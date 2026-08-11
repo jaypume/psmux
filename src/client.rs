@@ -956,8 +956,9 @@ fn write_lines_to_buffer(buf: &mut ratatui::buffer::Buffer, lines: &[ratatui::te
         'spans: for span in &line.spans {
             if x >= max_x { break; }
             let style = span.style;
-            for ch in span.content.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+           for ch in span.content.chars() {
+                let code = ch as u32;
+                let w = if code >= 0x20 && code < 0x7f { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) };
                 if w == 0 {
                     // 组合字符：追加到前一个 cell 的 symbol
                     if x > inner_x {
@@ -1061,8 +1062,9 @@ fn write_runs_to_buffer(
             }
 
             // char-iter 直写 buffer（处理截断、组合字符、宽字符）
-            for ch in text.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+           for ch in text.chars() {
+                let code = ch as u32;
+                let w = if code >= 0x20 && code < 0x7f { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) };
                 if w == 0 {
                     if x > inner_x {
                         let prev = row_base + (x - 1 - bx);
@@ -1090,14 +1092,17 @@ fn write_runs_to_buffer(
             }
         }
 
-        // padding：直接写空白 cell，不分配 String
-        let pad_style = Style::default().bg(last_bg);
-        while x < max_x {
-            let idx = row_base + (x - bx);
-            if idx < buf.content.len() {
-                buf.content[idx].set_symbol(" ").set_style(pad_style);
+       // padding：直接写空白 cell，不分配 String
+        // Clear 已将 cell 设为默认空白；仅在 last_bg 非默认时才需覆盖 padding
+        if last_bg != Color::Reset {
+            let pad_style = Style::default().bg(last_bg);
+            while x < max_x {
+                let idx = row_base + (x - bx);
+                if idx < buf.content.len() {
+                    buf.content[idx].set_symbol(" ").set_style(pad_style);
+                }
+                x += 1;
             }
-            x += 1;
         }
     }
 }
