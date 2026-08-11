@@ -2083,8 +2083,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // ── Cursor blink stabilisation ──────────────────────────────────
     // Cache the last-sent DECSCUSR code so we only write it when it
     // actually changes (avoids resetting WT's blink timer every frame).
-    let mut last_cursor_style: u8 = 255;
-    // Trap Ctrl+Break (and stray Ctrl+C) console signals so they interrupt the
+     let mut last_cursor_style: u8 = 255;
+     // 跨帧复用的光标 VT 输出缓冲，避免每帧 String::with_capacity(32) 分配。
+     let mut cursor_buf: String = String::with_capacity(32);
+     // Trap Ctrl+Break (and stray Ctrl+C) console signals so they interrupt the
     // pane's foreground program instead of terminating this client and
     // detaching the still-running session (issue #454).  The signal is drained
     // into cmd_batch as `send-key C-Break` at the top of each iteration.
@@ -5870,7 +5872,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
 
             // Right portion
-            let right_text = custom_status_right.as_deref().unwrap_or("").to_string();
+            let right_text = custom_status_right.as_deref().unwrap_or("");
             if client_log_enabled() {
                 client_log("status", &format!("parsing right_text ({} chars): [{}]",
                     right_text.len(), right_text.chars().take(100).collect::<String>()));
@@ -6483,26 +6485,26 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             };
             // Build a single VT string with: ?25h + CUP + DECSCUSR
             // ratatui's draw() always emits ?25l (since we never call
-            // f.set_cursor_position), so we must re-emit ?25h + CUP
-            // every frame when the cursor should be visible.
-            let mut buf = String::with_capacity(32);
-            if let Some((cx, cy)) = cursor_visible {
-                buf.push_str("\x1b[?25h");
-                use std::fmt::Write as FmtWrite;
-                let _ = write!(buf, "\x1b[{};{}H", cy + 1, cx + 1);
-            }
-            // DECSCUSR only when style actually changes (avoids blink
-            // timer resets in WT).
-            if effective != last_cursor_style {
-                last_cursor_style = effective;
-                use std::fmt::Write as FmtWrite;
-                let _ = write!(buf, "\x1b[{} q", effective);
-            }
-            if !buf.is_empty() {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(buf.as_bytes());
-                let _ = out.flush();
-            }
+             // f.set_cursor_position), so we must re-emit ?25h + CUP
+             // every frame when the cursor should be visible.
+             cursor_buf.clear();
+             if let Some((cx, cy)) = cursor_visible {
+                 cursor_buf.push_str("\x1b[?25h");
+                 use std::fmt::Write as FmtWrite;
+                 let _ = write!(cursor_buf, "\x1b[{};{}H", cy + 1, cx + 1);
+             }
+             // DECSCUSR only when style actually changes (avoids blink
+             // timer resets in WT).
+             if effective != last_cursor_style {
+                 last_cursor_style = effective;
+                 use std::fmt::Write as FmtWrite;
+                 let _ = write!(cursor_buf, "\x1b[{} q", effective);
+             }
+             if !cursor_buf.is_empty() {
+                 let mut out = std::io::stdout().lock();
+                 let _ = out.write_all(cursor_buf.as_bytes());
+                 let _ = out.flush();
+             }
 
             // Update Win32 system caret for accessibility / speech-to-text
             // tools (e.g. Wispr Flow).  Skip for SSH sessions — no local

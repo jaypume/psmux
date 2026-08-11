@@ -872,28 +872,30 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                  // 紧凑快照已取，锁释放。run-merge + JSON 构建均在锁外执行，
                  // reader 线程可并发处理 ConPTY 输出。
 
-                 // 锁外 run-merge：把 raw cells 合并成同色连续 run。
-                 // 比锁内做省不了总工作量，但不阻塞 reader（基准：锁内缩短 97%）。
-                 let snap_rows: Vec<RowSnap> = snap.raw_rows.iter().map(|row| {
-                     let mut runs: Vec<Run> = Vec::with_capacity(row.len());
-                     let mut prev_fg: Option<vt100::Color> = None;
-                     let mut prev_bg: Option<vt100::Color> = None;
-                     let mut prev_fl: u8 = 0;
-                     for cell in row {
-                         if prev_fg == Some(cell.fg) && prev_bg == Some(cell.bg) && prev_fl == cell.flags {
-                             if let Some(last) = runs.last_mut() {
-                                 last.text.push_str(&cell.text);
-                                 last.width += cell.width;
-                             }
-                         } else {
-                             runs.push(Run { text: cell.text.clone(), fg: cell.fg, bg: cell.bg, flags: cell.flags, width: cell.width });
-                         }
-                         prev_fg = Some(cell.fg);
-                         prev_bg = Some(cell.bg);
-                         prev_fl = cell.flags;
-                     }
-                     RowSnap { runs }
-                 }).collect();
+                  // 锁外 run-merge：把 raw cells 合并成同色连续 run。
+                  // 比锁内做省不了总工作量，但不阻塞 reader（基准：锁内缩短 97%）。
+                  // 用 into_iter 消费 raw_rows，使每个 run 首个 cell 的 text
+                  // 可以 mem::take 取出（move），避免 clone（省 ~500 次/帧）。
+                  let snap_rows: Vec<RowSnap> = snap.raw_rows.into_iter().map(|row| {
+                      let mut runs: Vec<Run> = Vec::with_capacity(row.len());
+                      let mut prev_fg: Option<vt100::Color> = None;
+                      let mut prev_bg: Option<vt100::Color> = None;
+                      let mut prev_fl: u8 = 0;
+                      for mut cell in row {
+                          if prev_fg == Some(cell.fg) && prev_bg == Some(cell.bg) && prev_fl == cell.flags {
+                              if let Some(last) = runs.last_mut() {
+                                  last.text.push_str(&cell.text);
+                                  last.width += cell.width;
+                              }
+                          } else {
+                              runs.push(Run { text: std::mem::take(&mut cell.text), fg: cell.fg, bg: cell.bg, flags: cell.flags, width: cell.width });
+                          }
+                          prev_fg = Some(cell.fg);
+                          prev_bg = Some(cell.bg);
+                          prev_fl = cell.flags;
+                      }
+                      RowSnap { runs }
+                  }).collect();
 
                 // ── leaf header ──────────────────────────────────────
                 let so = if is_active && in_copy { scroll_off } else { 0 };
