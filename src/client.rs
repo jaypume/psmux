@@ -600,10 +600,11 @@ fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
 }
 
 /// Collect all leaf pane IDs and their absolute rects from a LayoutJson tree.
-fn collect_pane_rects(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)>) {
+fn collect_pane_rects(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)>, meta: &mut Vec<(usize, bool, bool, bool)>) {
     match node {
-        LayoutJson::Leaf { id, .. } => {
+        LayoutJson::Leaf { id, wants_mouse, alternate_screen, active, .. } => {
             out.push((*id, area));
+            meta.push((*id, *wants_mouse, *alternate_screen, *active));
         }
         LayoutJson::Split { kind, sizes, children } => {
             let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
@@ -615,7 +616,7 @@ fn collect_pane_rects(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)
             let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
             for (i, child) in children.iter().enumerate() {
                 if i < rects.len() {
-                    collect_pane_rects(child, rects[i], out);
+                    collect_pane_rects(child, rects[i], out, meta);
                 }
             }
         }
@@ -2228,6 +2229,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
     // 预分配容量，避免首次填充时的 realloc（典型布局 < 32 panes）。
     let mut client_pane_rects: Vec<(usize, Rect)> = Vec::with_capacity(16);
+    // 缓存每个 pane 的 wants_mouse 和 alternate_screen，供 mouse handler 查询，
+    // 避免每次鼠标事件都重新 serde_json::from_str::<DumpState>（~148us/次）。
+    let mut client_pane_meta: Vec<(usize, bool, bool, bool)> = Vec::with_capacity(16);
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::with_capacity(16);
     // 跨帧复用的 border 路径栈（collect_layout_borders 的递归工作缓冲）。
     let mut border_path: Vec<usize> = Vec::with_capacity(16);
@@ -4428,10 +4432,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 // already forwarded above; with no client selection
                                                 // active, the Drag/Up arms forward mouse-drag /
                                                 // mouse-up so the app sees the full gesture.
-                                                let pane_handles_mouse =
-                                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
-                                                        .map(|s| pane_wants_mouse_json(&s.layout, pane_id))
-                                                        .unwrap_or(false);
+                                               let pane_handles_mouse =
+                                                   client_pane_meta.iter()
+                                                       .find(|(id, _, _, _)| *id == pane_id)
+                                                       .map(|(_, wm, _, _)| *wm)
+                                                       .unwrap_or(false);
                                                 if !client_mouse_selection || pane_handles_mouse {
                                                     rsel_start = None;
                                                     rsel_end = None;
@@ -4520,11 +4525,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // Check if active pane is running a TUI app (alternate screen).
                                 // TUI apps (htop, Claude Code, etc.) expect right-click as a
                                 // mouse event, NOT clipboard paste.
-                                let tui_active = if !prev_dump_buf.is_empty() {
-                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
-                                        .map(|s| active_pane_in_alt_screen(&s.layout))
-                                        .unwrap_or(false)
-                                } else { false };
+                                let tui_active = client_pane_meta.iter()
+                                    .find(|(_, _, _, active)| *active)
+                                    .map(|(_, _, alt, _)| *alt)
+                                    .unwrap_or(false);
 
                                 if tui_active {
                                     // Forward right-click as pane-relative mouse event
@@ -5296,7 +5300,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
             client_content_area = content_chunk;
             client_pane_rects.clear();
-            collect_pane_rects(&root, content_chunk, &mut client_pane_rects);
+            client_pane_meta.clear();
+            collect_pane_rects(&root, content_chunk, &mut client_pane_rects, &mut client_pane_meta);
             client_borders.clear();
             border_path.clear();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
