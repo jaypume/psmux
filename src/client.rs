@@ -2408,16 +2408,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
         let poll_ms = if paste_pend_active { 1 }
             else if got_frame { 0 }
-            else if dump_in_flight { 5 }
+            else if dump_in_flight { 1 }
             else if force_dump { 0 }
             else if typing_active {
-                // Rate-limit to ~100fps (10ms) when typing.  The snapshot-
-                // based serialisation in dump_layout_json_fast now holds
-                // the parser mutex for only ~1ms (cell snapshot), so
-                // polling at 10ms no longer starves the ConPTY reader
-                // thread.  10ms is notably shorter than ConPTY's ~16ms
-                // render interval, avoiding systematic alignment delays.
-                let remaining = 10u64.saturating_sub(since_dump);
+                // Typing: cap poll at 5ms so auto-pushed frames are
+                // drained within one vsync.  dump-state request rate is
+                // still limited to ~100fps by the since_dump>=10 check
+                // below, so this only affects frame-drain latency.
+                // max(1) prevents busy-looping when since_dump>=10.
+                // (was 10ms; reduced for lower frame-drain latency.)
+                let remaining = 10u64.saturating_sub(since_dump).max(1).min(5);
                 remaining
             }
             else {
