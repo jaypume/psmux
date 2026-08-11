@@ -6726,16 +6726,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // Cache this frame so we can skip identical re-renders.
         // Only update cache when we got a genuinely new frame (not selection-only redraw)
         if got_frame && dump_gen != prev_dump_gen {
+            // Echo arrived: clear the key-send timer BEFORE updating
+            // prev_dump_gen, so the NC re-request path knows to stop.
+            // Without this, key_send_instant stays Some for 30ms after
+            // every keystroke, causing a wasteful NC -> dump-state
+            // busy-loop on both client and server.
+            key_send_instant = None;
             std::mem::swap(&mut prev_dump_buf, &mut dump_buf);
             prev_dump_gen = dump_gen;
         }
         // DON'T clear last_key_send_time — keep fast-dumping for 100ms
         // after last keystroke so we catch the ConPTY echo promptly.
         // The timer expires naturally in the poll_ms calculation above.
-        // Clear key_send_instant once echo arrives (frame differs).
-        if got_frame && dump_gen != prev_dump_gen {
-            key_send_instant = None;
-        }
         force_dump = false;
     }
 
