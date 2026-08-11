@@ -1034,7 +1034,8 @@ pub fn render_layout_json(
             // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
             let inner = pane_content_inner(area, border_status, border_format);
-            let mut lines: Vec<Line> = Vec::new();
+            // 预分配行数，减少重分配
+            let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
             let use_full_cells = *copy_mode && *active && !content.is_empty();
             // If the source pane is larger than the preview area, reflow
             // (word-wrap) the rows onto preview-width lines instead of
@@ -1058,7 +1059,8 @@ pub fn render_layout_json(
                 // 避免每个 cell 都重新 parse "bg=yellow,fg=black" 字符串。
                 let mut selection_style: Option<Style> = None;
                 for r in 0..inner.height.min(content.len() as u16) {
-                    let mut spans: Vec<Span> = Vec::new();
+                    // 预分配：每行通常 5-15 个 run + padding
+                    let mut spans: Vec<Span> = Vec::with_capacity(8);
                     let row = &content[r as usize];
                     let max_c = inner.width.min(row.len() as u16);
                     let mut c: u16 = 0;
@@ -1134,7 +1136,8 @@ pub fn render_layout_json(
                 }
             } else {
                 for r in 0..inner.height.min(rows_v2_eff.len() as u16) {
-                    let mut spans: Vec<Span> = Vec::new();
+                    // 预分配：每行通常 5-15 个 run + padding
+                    let mut spans: Vec<Span> = Vec::with_capacity(8);
                     let mut c: u16 = 0;
                     let mut last_bg = Color::Reset;
                     for run in &rows_v2_eff[r as usize].runs {

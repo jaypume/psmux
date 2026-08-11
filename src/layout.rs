@@ -662,26 +662,70 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     /// Append a `vt100::Color` as its JSON string value (**no** surrounding quotes).
      fn push_color(c: vt100::Color, out: &mut String) {
          match c {
-             // 空串编码 Default：每帧 ~900 次出现，省 7 字节/次。
-             // client 的 map_color("") 已映射到 Color::Reset。
-             vt100::Color::Default => {}
-             vt100::Color::Idx(i) => {
-                 let _ = std::fmt::Write::write_fmt(out, format_args!("idx:{}", i));
-             }
-             vt100::Color::Rgb(r, g, b) => {
-                 let _ = std::fmt::Write::write_fmt(out, format_args!("rgb:{},{},{}", r, g, b));
-             }
-         }
-     }
+            // 空串编码 Default：每帧 ~900 次出现，省 7 字节/次。
+            // client 的 map_color("") 已映射到 Color::Reset。
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) => {
+                out.push_str("idx:");
+                push_usize(i as usize, out);
+            }
+            vt100::Color::Rgb(r, g, b) => {
+                out.push_str("rgb:");
+                push_u8(r, out);
+                out.push(',');
+                push_u8(g, out);
+                out.push(',');
+                push_u8(b, out);
+            }
+        }
+    }
 
-     /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
-     fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
-         out.push_str("\",\"f\":\"");
-         push_color(fg, out);
-         out.push_str("\",\"b\":\"");
-         push_color(bg, out);
-         let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"x\":{},\"w\":{}}}", fl, w));
-     }
+    /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
+    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
+        out.push_str("\",\"f\":\"");
+        push_color(fg, out);
+        out.push_str("\",\"b\":\"");
+        push_color(bg, out);
+        out.push_str("\",\"x\":");
+        push_u8(fl, out);
+        out.push_str(",\"w\":");
+        push_u16(w, out);
+        out.push('}');
+    }
+
+    /// 手写整数转 ASCII，避免 format_args! 的 trait dispatch 开销。
+    /// 热路径 per-run 调用 ~490 次/帧。
+    fn push_u8(n: u8, out: &mut String) {
+        if n < 10 {
+            out.push((b'0' + n) as char);
+        } else if n < 100 {
+            out.push((b'0' + n / 10) as char);
+            out.push((b'0' + n % 10) as char);
+        } else {
+            out.push((b'0' + n / 100) as char);
+            let rem = n % 100;
+            out.push((b'0' + rem / 10) as char);
+            out.push((b'0' + rem % 10) as char);
+        }
+    }
+
+    fn push_u16(n: u16, out: &mut String) {
+        if n < 256 { push_u8(n as u8, out); }
+        else {
+            // 256..=65535: 先写高位（1-2 位），再写低 2 位
+            let hi = n / 100;
+            push_u8(hi as u8, out);
+            let lo = n % 100;
+            out.push((b'0' + (lo / 10) as u8) as char);
+            out.push((b'0' + (lo % 10) as u8) as char);
+        }
+    }
+
+    fn push_usize(n: usize, out: &mut String) {
+        // 色彩索引值 0-255，实际只会走 u8 路径
+        if n < 256 { push_u8(n as u8, out); }
+        else { let _ = std::fmt::Write::write_fmt(out, format_args!("{}", n)); }
+    }
 
     // ── recursive tree walker ────────────────────────────────────────
 
@@ -807,9 +851,10 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                      // 锁内直接 run-merge：只对每个 run 首 cell 做 to_string()，
                      // 后续 cell 用 push_str（已有容量不分配）。比旧方案少 ~7500 次堆分配/帧。
                      let mut rows_v2: Vec<RowSnap> = Vec::with_capacity(p.last_rows as usize);
-                     for r in 0..p.last_rows {
-                         let mut runs: Vec<Run> = Vec::new();
-                         let mut prev_fg: Option<vt100::Color> = None;
+                    for r in 0..p.last_rows {
+                        // 每行通常 5-15 个 run，预分配 8 减少重分配
+                        let mut runs: Vec<Run> = Vec::with_capacity(8);
+                        let mut prev_fg: Option<vt100::Color> = None;
                          let mut prev_bg: Option<vt100::Color> = None;
                          let mut prev_fl: u8 = 0;
                          let mut c = 0u16;
