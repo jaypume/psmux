@@ -5285,17 +5285,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         frame_hyperlinks_clear();
         terminal.draw(|f| {
             let area = f.area();
-            let constraints = if status_at_top {
-                vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
-            } else {
-                vec![Constraint::Min(1), Constraint::Length(status_lines as u16)]
-            };
-            let chunks = Layout::default().direction(Direction::Vertical)
-                .constraints(constraints).split(area);
+            // 直接算术替代 ratatui Layout solver（Cassowary 约束求解），
+            // 省掉 Vec<Constraint> 分配 + 约束求解开销。
+            let status_h = (status_lines as u16).min(area.height.saturating_sub(1));
+            let content_h = area.height - status_h;
             let (content_chunk, status_chunk) = if status_at_top {
-                (chunks[1], chunks[0])
+                (Rect::new(area.x, area.y + status_h, area.width, content_h),
+                 Rect::new(area.x, area.y, area.width, status_h))
             } else {
-                (chunks[0], chunks[1])
+                (Rect::new(area.x, area.y, area.width, content_h),
+                 Rect::new(area.x, area.y + content_h, area.width, status_h))
             };
 
             client_content_area = content_chunk;
