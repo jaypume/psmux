@@ -1987,6 +1987,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(json);
                 }
                 CtrlReq::DumpState(resp, allow_nc, dump_client_id) => {
+                    // ── Echo-wait: if a key was just sent in this batch and
+                    // ConPTY echo hasn't been processed yet, briefly wait for
+                    // the parser thread to catch up. This prevents serializing
+                    // a pre-echo frame that the client would render and then
+                    // immediately replace when the echo arrives (double-render).
+                    if echo_pending_until.map_or(false, |t| t.elapsed().as_millis() < 50) {
+                        let wait_start = std::time::Instant::now();
+                        while wait_start.elapsed().as_micros() < 2000 {
+                            if crate::types::PTY_DATA_READY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                                state_dirty = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                        }
+                    }
                     // ── Activity / bell / silence detection ──
                     let alert_hooks = helpers::check_window_activity(&mut app);
                     for event in &alert_hooks {

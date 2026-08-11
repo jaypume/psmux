@@ -2090,16 +2090,16 @@ pub fn spawn_reader_thread(
     //     bytes into a staging buffer. Never touches the parser mutex, so
     //     reads cannot be starved by snapshot work.
     //   • Parser thread: waits for staged bytes, then ADAPTIVELY coalesces:
-    //     sleeps 1ms; if more bytes arrived, sleeps again; hard cap 8ms total.
+    //     sleeps 200us; if more bytes arrived, sleeps again; hard cap 8ms total.
     //     Then locks the parser ONCE and processes the entire batch
     //     atomically. Multi-chunk frames that arrive within the coalescing
     //     window land as a single unit — the snapshot can no longer observe
     //     a partial frame.
     //
-    // Latency cost: 1ms minimum between byte arrival and render for streaming
+    // Latency cost: 200us minimum between byte arrival and render for streaming
     // output, capped at 8ms for sustained streams. Imperceptible to humans
     // and well below the 50ms keystroke-echo threshold.
-    const COALESCE_TICK_MS: u64 = 1;
+    const COALESCE_TICK_US: u64 = 200;
     const COALESCE_MAX_MS: u128 = 8;
 
     let staging: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::with_capacity(131072)), Condvar::new()));
@@ -2277,7 +2277,7 @@ pub fn spawn_reader_thread(
             };
             loop {
                 if coalesce_start.elapsed().as_millis() >= COALESCE_MAX_MS { break; }
-                thread::sleep(Duration::from_millis(COALESCE_TICK_MS));
+                thread::sleep(Duration::from_micros(COALESCE_TICK_US));
                 let cur_len = {
                     let (lock, _) = &*staging;
                     lock.lock().map(|b| b.len()).unwrap_or(0)
