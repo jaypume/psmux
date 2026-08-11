@@ -2010,6 +2010,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut cmd_batch: Vec<String> = Vec::new();
     let mut dump_buf = String::new();
     let mut prev_dump_buf = String::new();
+    // generation 计数器：每次 dump_buf 被赋新值时递增，用于 O(1) 判断帧是否
+    // 变化，替代 50-100KB 的逐字节字符串比较（frame-skip / cache-update）。
+    let mut dump_gen: u64 = 0;
+    let mut prev_dump_gen: u64 = 0;
     let mut last_key_send_time: Option<Instant> = None;
     let mut dump_in_flight = false;
     let mut dump_flight_start: Instant = Instant::now();
@@ -2042,10 +2046,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // the client actually renders, so we track positions at render time.
     let mut client_tab_positions: Vec<(usize, u16, u16)> = Vec::new(); // (window_display_idx, x_start, x_end)
     let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
-    let mut client_pane_rects: Vec<(usize, Rect)> = Vec::new();
-    let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
+    // 预分配容量，避免首次填充时的 realloc（典型布局 < 32 panes）。
+    let mut client_pane_rects: Vec<(usize, Rect)> = Vec::with_capacity(16);
+    let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::with_capacity(16);
     // 跨帧复用的 border 路径栈（collect_layout_borders 的递归工作缓冲）。
-    let mut border_path: Vec<usize> = Vec::new();
+    let mut border_path: Vec<usize> = Vec::with_capacity(16);
     let mut client_content_area: Rect = Rect::default();
     // Border status/format from the last draw, for cursor/mouse inner-rect calc.
     let mut client_border_status: String = "off".to_string();
@@ -2160,6 +2165,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         if client_log_enabled() {
                             client_log("frame", &format!("received {} bytes", line.len()));
                         }
+                        dump_gen = dump_gen.wrapping_add(1);
                         dump_buf = line; got_frame = true; dump_in_flight = false;
                     }
                 }
@@ -4811,13 +4817,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
-        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active {
+        if dump_gen == prev_dump_gen && !selection_changed && !overlays_active {
             last_dump_time = Instant::now();
             continue;
         }
 
         // Parse the frame (use prev_dump_buf for selection-only redraws)
-        let frame_to_parse = if got_frame && dump_buf != prev_dump_buf { &dump_buf } else { &prev_dump_buf };
+        let frame_to_parse = if got_frame && dump_gen != prev_dump_gen { &dump_buf } else { &prev_dump_buf };
         let _t_parse = Instant::now();
         let state: DumpState = match serde_json::from_str(frame_to_parse) {
             Ok(s) => s,
@@ -6518,7 +6524,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             let _ = writeln!(log, "L{}: key->render {}ms  parse={}us  render={}us  json_len={}  since_dump={}",
                 loop_count, elapsed_ms, _parse_us, _render_us, dump_buf.len(), since_dump);
             // Only clear after we rendered a DIFFERENT frame (echo arrived)
-            if got_frame && dump_buf != prev_dump_buf {
+            if got_frame && dump_gen != prev_dump_gen {
                 let _ = writeln!(log, "L{}: ECHO VISIBLE after {}ms  (parse={}us render={}us)",
                     loop_count, elapsed_ms, _parse_us, _render_us);
                 key_send_instant = None;
@@ -6527,14 +6533,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         selection_changed = false;
         // Cache this frame so we can skip identical re-renders.
         // Only update cache when we got a genuinely new frame (not selection-only redraw)
-        if got_frame && dump_buf != prev_dump_buf {
+        if got_frame && dump_gen != prev_dump_gen {
             std::mem::swap(&mut prev_dump_buf, &mut dump_buf);
+            prev_dump_gen = dump_gen;
         }
         // DON'T clear last_key_send_time — keep fast-dumping for 100ms
         // after last keystroke so we catch the ConPTY echo promptly.
         // The timer expires naturally in the poll_ms calculation above.
         // Clear key_send_instant once echo arrives (frame differs).
-        if got_frame && dump_buf != prev_dump_buf {
+        if got_frame && dump_gen != prev_dump_gen {
             key_send_instant = None;
         }
         force_dump = false;
