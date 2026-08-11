@@ -599,12 +599,21 @@ fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
     }
 }
 
-/// Collect all leaf pane IDs and their absolute rects from a LayoutJson tree.
-fn collect_pane_rects(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)>, meta: &mut Vec<(usize, bool, bool, bool)>) {
+/// 一次遍历同时收集 leaf pane rects/meta 和 split border 位置。
+/// 替代原先 collect_pane_rects + collect_layout_borders 的两次独立遍历，
+/// 消除每个 Split 节点重复的 effective_sizes 分配 + split_with_gaps 计算。
+fn collect_layout_meta(
+    node: &LayoutJson,
+    area: Rect,
+    path: &mut Vec<usize>,
+    pane_rects: &mut Vec<(usize, Rect)>,
+    pane_meta: &mut Vec<(usize, bool, bool, bool)>,
+    borders: &mut Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)>,
+) {
     match node {
         LayoutJson::Leaf { id, wants_mouse, alternate_screen, active, .. } => {
-            out.push((*id, area));
-            meta.push((*id, *wants_mouse, *alternate_screen, *active));
+            pane_rects.push((*id, area));
+            pane_meta.push((*id, *wants_mouse, *alternate_screen, *active));
         }
         LayoutJson::Split { kind, sizes, children } => {
             let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
@@ -614,47 +623,23 @@ fn collect_pane_rects(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)
             };
             let is_horizontal = kind == "Horizontal";
             let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-            for (i, child) in children.iter().enumerate() {
+            let total_px = if is_horizontal { area.width } else { area.height };
+            for i in 0..children.len().saturating_sub(1) {
                 if i < rects.len() {
-                    collect_pane_rects(child, rects[i], out, meta);
+                    let pos = if is_horizontal {
+                        rects[i].x + rects[i].width
+                    } else {
+                        rects[i].y + rects[i].height
+                    };
+                    borders.push((path.clone(), kind.clone(), i, pos, total_px, effective_sizes.clone(), area));
                 }
             }
-        }
-    }
-}
-
-/// Collect all split border positions from a LayoutJson tree.
-/// Returns: (tree_path_to_parent, kind, child_index, border_pixel_pos, total_pixels, sizes_snapshot)
-fn collect_layout_borders(
-    node: &LayoutJson,
-    area: Rect,
-    path: &mut Vec<usize>,
-    out: &mut Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)>,
-) {
-    if let LayoutJson::Split { kind, sizes, children } = node {
-        let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-            sizes.clone()
-        } else {
-            vec![(100 / children.len().max(1)) as u16; children.len()]
-        };
-        let is_horizontal = kind == "Horizontal";
-        let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-        let total_px = if is_horizontal { area.width } else { area.height };
-        for i in 0..children.len().saturating_sub(1) {
-            if i < rects.len() {
-                let pos = if is_horizontal {
-                    rects[i].x + rects[i].width
-                } else {
-                    rects[i].y + rects[i].height
-                };
-                out.push((path.clone(), kind.clone(), i, pos, total_px, effective_sizes.clone(), area));
-            }
-        }
-        for (i, child) in children.iter().enumerate() {
-            if i < rects.len() {
-                path.push(i);
-                collect_layout_borders(child, rects[i], path, out);
-                path.pop();
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() {
+                    path.push(i);
+                    collect_layout_meta(child, rects[i], path, pane_rects, pane_meta, borders);
+                    path.pop();
+                }
             }
         }
     }
@@ -2233,7 +2218,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // 避免每次鼠标事件都重新 serde_json::from_str::<DumpState>（~148us/次）。
     let mut client_pane_meta: Vec<(usize, bool, bool, bool)> = Vec::with_capacity(16);
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::with_capacity(16);
-    // 跨帧复用的 border 路径栈（collect_layout_borders 的递归工作缓冲）。
+    // 跨帧复用的 border 路径栈（collect_layout_meta 的递归工作缓冲）。
     let mut border_path: Vec<usize> = Vec::with_capacity(16);
     let mut client_content_area: Rect = Rect::default();
     // Border status/format from the last draw, for cursor/mouse inner-rect calc.
@@ -5300,10 +5285,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             client_content_area = content_chunk;
             client_pane_rects.clear();
             client_pane_meta.clear();
-            collect_pane_rects(&root, content_chunk, &mut client_pane_rects, &mut client_pane_meta);
             client_borders.clear();
             border_path.clear();
-            collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
+            // 单次遍历同时收集 pane rects/meta 和 split borders，
+            // 消除原先两次独立遍历的重复 split_with_gaps 计算。
+            collect_layout_meta(&root, content_chunk, &mut border_path,
+                &mut client_pane_rects, &mut client_pane_meta, &mut client_borders);
 
             let active_rect = compute_active_rect_json_zoom_aware(&root, content_chunk, state.zoomed);
             let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);

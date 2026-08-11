@@ -2131,8 +2131,18 @@ pub fn register_frame_channel(client_id: u64) -> FrameSlot {
 /// Option::replace, never across I/O.
 /// Dead slots (poisoned mutex) are pruned automatically.
 pub fn push_frame(frame: &str) {
+    push_frame_except(frame, u64::MAX);
+}
+
+/// Push a frame to all clients except the one matching `except_client_id`.
+/// Used by the DumpState handler: the requesting client receives its copy
+/// via the high-priority resp channel, so pushing to its frame slot too
+/// would deliver the same 50-100KB frame twice (wasted alloc + TCP write).
+pub fn push_frame_except(frame: &str, except_client_id: u64) {
     if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
-        slots.retain(|(_, slot)| {
+        slots.retain(|(cid, slot)| {
+            // Skip the requesting client — it gets the frame via resp channel
+            if *cid == except_client_id { return true; }
             match slot.lock() {
                 Ok(mut s) => { *s = Some(frame.to_string()); true }
                 Err(_) => false, // writer thread panicked; prune
