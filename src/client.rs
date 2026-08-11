@@ -2016,7 +2016,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         clock_colour: Option<String>,
         /// Dynamic key bindings from server
         #[serde(default)]
-        bindings: Vec<BindingEntry>,
+        bindings: Option<Vec<BindingEntry>>,
         /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a)
         #[serde(default)]
         defaults_suppressed: bool,
@@ -5174,9 +5174,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
         }
 
-        // Sync key bindings from server
-        if !state.bindings.is_empty() || !synced_bindings.is_empty() {
-            synced_bindings = state.bindings;
+        // Sync key bindings from server. Option::None means server omitted
+        // the field (bindings unchanged) — keep the cached copy.
+        if let Some(b) = state.bindings {
+            synced_bindings = b;
         }
         defaults_suppressed = state.defaults_suppressed;
         scroll_enter_copy_mode = state.scroll_enter_copy_mode;

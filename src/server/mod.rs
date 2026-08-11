@@ -1177,6 +1177,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let mut cached_pred_dim: bool = false;
     let mut cached_status_style = String::new();
     let mut cached_bindings_json = String::from("[]");
+    // True after meta_dirty rebuilds bindings; cleared by the first auto-push that
+    // delivers them to all clients. The DumpState handler also checks it but
+    // does NOT clear it (its response goes to one client only).
+    let mut bindings_need_push = true;
     // Reusable buffer for building the combined JSON envelope.
     let mut combined_buf = String::with_capacity(32768);
 
@@ -2099,8 +2103,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         cached_pred_dim = app.prediction_dimming;
                         cached_status_style = app.status_style.clone();
                         cached_bindings_json = serialize_bindings_json(&app);
+                        bindings_need_push = true;
                         meta_dirty = false;
                     }
+                    // Include full bindings for first-time clients or when
+                    // they just changed; otherwise send null (client keeps cache).
+                    let bindings_arg: &str = if !dump_state_seen_full.contains(&dump_client_id) || bindings_need_push {
+                        &cached_bindings_json
+                    } else {
+                        "null"
+                    };
                     let _t_layout = std::time::Instant::now();
                     let layout_json = dump_layout_json_fast(&mut app)?;
                     let _layout_ms = _t_layout.elapsed().as_micros();
@@ -2139,7 +2151,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
                         "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
-                        matches!(app.mode, Mode::ClockMode), cached_bindings_json,
+                        matches!(app.mode, Mode::ClockMode), bindings_arg,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
                         mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                         cursor_style_code, app.status_visible, app.repeat_time_ms,
@@ -5818,8 +5830,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 cached_pred_dim = app.prediction_dimming;
                 cached_status_style = app.status_style.clone();
                 cached_bindings_json = serialize_bindings_json(&app);
+                bindings_need_push = true;
                 meta_dirty = false;
             }
+            // Only include bindings when changed; clients cache from prior frames.
+            let bindings_arg: &str = if bindings_need_push {
+                bindings_need_push = false;
+                &cached_bindings_json
+            } else {
+                "null"
+            };
             let layout_json = dump_layout_json_fast(&mut app)?;
             combined_buf.clear();
             // #372: style options must be format-expanded too (see persistent
@@ -5851,7 +5871,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
                 "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
-                matches!(app.mode, Mode::ClockMode), cached_bindings_json,
+                matches!(app.mode, Mode::ClockMode), bindings_arg,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
                 mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                 cursor_style_code, app.status_visible, app.repeat_time_ms,
