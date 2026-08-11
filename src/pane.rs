@@ -2267,9 +2267,10 @@ pub fn spawn_reader_thread(
                 // keep pushing while we run the adaptive coalescing wait.
             }
 
-            // Adaptive coalescing: keep waiting in 1ms ticks while new bytes
-            // are still arriving, hard-capped at 8ms total. This bridges
-            // multi-chunk frames into a single atomic parser update.
+            // Adaptive coalescing: check for frame boundary BEFORE sleeping.
+            // Old code slept first then checked — single-chunk output (echo)
+            // wasted a full tick (~500us on Windows). Now: check immediately,
+            // only sleep when more bytes are still arriving.
             let coalesce_start = Instant::now();
             let mut last_len: usize = {
                 let (lock, _) = &*staging;
@@ -2277,16 +2278,17 @@ pub fn spawn_reader_thread(
             };
             loop {
                 if coalesce_start.elapsed().as_millis() >= COALESCE_MAX_MS { break; }
-                thread::sleep(Duration::from_micros(COALESCE_TICK_US));
+                // Check for new bytes BEFORE sleeping. If no new bytes arrived
+                // since last check, this is a frame boundary — no wait needed.
                 let cur_len = {
                     let (lock, _) = &*staging;
                     lock.lock().map(|b| b.len()).unwrap_or(0)
                 };
                 if cur_len == last_len {
-                    // No new bytes arrived in the last tick — frame boundary.
                     break;
                 }
                 last_len = cur_len;
+                thread::sleep(Duration::from_micros(COALESCE_TICK_US));
             }
 
             // Take the entire staged batch.

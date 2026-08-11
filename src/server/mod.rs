@@ -2003,7 +2003,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 state_dirty = true;
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            let elapsed_us = wait_start.elapsed().as_micros();
+                            if elapsed_us < 300 {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_micros(100));
+                            }
                         }
                     }
                     // ── Activity / bell / silence detection ──
