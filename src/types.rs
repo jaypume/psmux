@@ -476,6 +476,9 @@ pub struct ShellEntry {
 pub struct AppState {
     pub windows: Vec<Window>,
     pub active_idx: usize,
+    /// Per-pane (id -> data_version) from the last serialized frame.
+    /// Used by dump_layout_json_fast to skip rows_v2 for unchanged panes.
+    pub last_serialized_versions: Vec<(usize, u64)>,
     /// While a temporary -t focus is applied (FocusTargetTemp), holds the
     /// REAL user-visible active window index saved before the switch.
     /// Format evaluation uses it for "is this the active window" variables
@@ -1137,6 +1140,7 @@ impl AppState {
         Self {
             windows: Vec::new(),
             active_idx: 0,
+            last_serialized_versions: Vec::new(),
             temp_focus_saved_active: None,
             mode: Mode::Passthrough,
             escape_time_ms: 500,

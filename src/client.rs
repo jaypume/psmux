@@ -107,6 +107,12 @@ thread_local! {
     /// recursive `render_layout_json`.
     static FRAME_HYPERLINKS: std::cell::RefCell<Vec<HyperlinkRun>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Per-pane content cache for pane-level delta. Maps pane id to
+    /// (data_version, rows_v2). When the server skips a pane (rows_v2:[]
+    /// with matching v), the client reuses the cached rows_v2.
+    static PANE_ROWS_CACHE: std::cell::RefCell<std::collections::HashMap<usize, (u64, Vec<RowRunsJson>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub(crate) fn frame_hyperlinks_clear() {
@@ -1134,8 +1140,29 @@ pub fn render_layout_json(
             copy_cursor_col,
             content,
             rows_v2,
+            v,
             title,
         } => {
+            // Pane-level delta restore: if the server skipped this pane's rows
+            // (empty rows_v2 + non-zero v), check the cache. If v matches,
+            // reuse the prior frame's rows_v2 for this pane.
+            let restored_holder: Option<Vec<RowRunsJson>>;
+            let rows_v2: &[RowRunsJson] = if rows_v2.is_empty() && *v != 0 {
+                let hit = PANE_ROWS_CACHE.with(|c| c.borrow().get(id).cloned());
+                match hit {
+                    Some((cv, ref cr)) if cv == *v => {
+                        restored_holder = Some(cr.clone());
+                        restored_holder.as_deref().unwrap_or(rows_v2)
+                    }
+                    _ => rows_v2,
+                }
+            } else {
+                rows_v2
+            };
+            // Cache the current rows_v2 for future delta frames (non-empty only).
+            if !rows_v2.is_empty() && *v != 0 {
+                PANE_ROWS_CACHE.with(|c| { c.borrow_mut().insert(*id, (*v, rows_v2.to_vec())); });
+            }
             // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
             let inner = pane_content_inner(area, border_status, border_format);
@@ -1155,7 +1182,7 @@ pub fn render_layout_json(
                 scaled_holder = downscale_rows_v2(rows_v2, *src_rows, *src_cols, inner.height, inner.width);
                 &scaled_holder
             } else {
-                rows_v2.as_slice()
+                rows_v2
             };
             // 提前计算 gutter_w 和快速路径判断
             let gutter_w: u16 = if *copy_mode && *active {

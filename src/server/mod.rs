@@ -2114,7 +2114,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "null"
                     };
                     let _t_layout = std::time::Instant::now();
-                    let layout_json = dump_layout_json_fast(&mut app)?;
+                    let layout_json = dump_layout_json_fast(&mut app, false)?;
                     let _layout_ms = _t_layout.elapsed().as_micros();
                     combined_buf.clear();
                     // #372: style options must be format-expanded too, so a
@@ -5840,7 +5840,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             } else {
                 "null"
             };
-            let layout_json = dump_layout_json_fast(&mut app)?;
+            let layout_json = dump_layout_json_fast(&mut app, true)?;
             combined_buf.clear();
             // #372: style options must be format-expanded too (see persistent
             // path above). wsf/wscf stay raw: per-window formats the client

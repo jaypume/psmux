@@ -180,6 +180,11 @@ pub enum LayoutJson {
         content: Vec<Vec<CellJson>>,
         #[serde(default)]
         rows_v2: Vec<RowRunsJson>,
+        /// Per-pane data version. Client caches rows_v2 by pane id; when v
+        /// matches the cached version, it reuses the prior rows_v2 instead
+        /// of re-rendering. 0 means "always send" (backward compat).
+        #[serde(default)]
+        v: u64,
         /// Pane title for border label expansion
         #[serde(default)]
         title: Option<String>,
@@ -329,7 +334,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![], title: None,
+                            content: vec![], rows_v2: vec![], v: 0, title: None,
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -350,7 +355,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![], title: None,
+                        content: vec![], rows_v2: vec![], v: 0, title: None,
                     };
                 };
                 let screen = parser.screen();
@@ -531,6 +536,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     copy_cursor_col: None,
                     content: lines,
                     rows_v2,
+                    v: 0,
                     title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
                 }
             }
@@ -629,7 +635,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
 /// a pre-allocated `String`, avoiding the intermediate `LayoutJson` / `CellRunJson`
 /// allocations **and** the `serde_json::to_string` traversal.  Produces the
 /// identical JSON format that the client deserialises into `LayoutJson`.
-pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
+pub fn dump_layout_json_fast(app: &mut AppState, enable_delta: bool) -> io::Result<String> {
     let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
     sync_copy_freeze(app, in_copy);
     let scroll_off = app.copy_scroll_offset;
@@ -740,6 +746,8 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
         cpos: Option<(u16, u16)>,
         sel_mode: crate::types::SelectionMode,
         out: &mut String,
+        prev_versions: &mut Vec<(usize, u64)>,
+        enable_delta: bool,
     ) {
         match node {
             Node::Split { kind, sizes, children } => {
@@ -757,7 +765,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 for (i, c) in children.iter_mut().enumerate() {
                     if i > 0 { out.push(','); }
                     cur_path.push(i);
-                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, out);
+                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, out, prev_versions, enable_delta);
                     cur_path.pop();
                 }
                 out.push_str("]}");
@@ -1054,19 +1062,36 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 }
 
                 // ── rows_v2 (from snapshot, no mutex held) ───────────
-                 out.push_str("\"rows_v2\":[");
-                 for (ri, row) in snap_rows.iter().enumerate() {
-                     if ri > 0 { out.push(','); }
-                     out.push_str("{\"r\":[");
-                     for (i, run) in row.runs.iter().enumerate() {
-                         if i > 0 { out.push(','); }
-                         out.push_str("{\"t\":\"");
-                         json_esc(&run.text, out);
-                         close_run(run.fg, run.bg, run.flags, run.width, out);
-                     }
-                     out.push_str("]}");
-                 }
-                out.push_str("]");
+                // Pane-level delta: if data_version is unchanged since the last
+                // serialized frame AND the pane isn't in copy-mode (which needs
+                // full cell content), skip the row data and emit version only.
+                // Client reuses its cached rows_v2 for this pane.
+                let cur_dv = p.data_version.load(std::sync::atomic::Ordering::Relaxed);
+                let prev_dv = prev_versions.iter().find(|(pid, _)| *pid == p.id).map(|(_, v)| *v);
+                let unchanged = enable_delta && !need_content && prev_dv == Some(cur_dv);
+                if unchanged {
+                    // Skip: client keeps its cached copy for this pane id.
+                    let _ = std::fmt::Write::write_fmt(out, format_args!(
+                        "\"rows_v2\":[],\"v\":{}", cur_dv));
+                } else {
+                    // Full serialize + record version for next frame's delta.
+                    prev_versions.retain(|(pid, _)| *pid != p.id);
+                    prev_versions.push((p.id, cur_dv));
+                    out.push_str("\"rows_v2\":[");
+                    for (ri, row) in snap_rows.iter().enumerate() {
+                        if ri > 0 { out.push(','); }
+                        out.push_str("{\"r\":[");
+                        for (i, run) in row.runs.iter().enumerate() {
+                            if i > 0 { out.push(','); }
+                            out.push_str("{\"t\":\"");
+                            json_esc(&run.text, out);
+                            close_run(run.fg, run.bg, run.flags, run.width, out);
+                        }
+                        out.push_str("]}");
+                    }
+                    out.push_str("],\"v\":");
+                    let _ = std::fmt::Write::write_fmt(out, format_args!("{}", cur_dv));
+                }
                 // Append pane title if set
                 if !p.title.is_empty() {
                     out.push_str(",\"title\":\"");
@@ -1082,10 +1107,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let active_path = win.active_path.clone();
     let mut path = Vec::new();
     let mut out = String::with_capacity(32768);
+    // Tracks each pane's last-serialized data_version for pane-level delta.
+    // Lives in AppState so it persists across frames within one server run.
+    let mut prev_versions = std::mem::take(&mut app.last_serialized_versions);
     write_node(
         &mut win.root, &mut path, &active_path,
-        in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, &mut out,
+        in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, &mut out, &mut prev_versions, enable_delta,
     );
+    app.last_serialized_versions = prev_versions;
     Ok(out)
 }
 
