@@ -6533,6 +6533,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         popup_cursor_screen_pos(content_chunk, srv_popup_width,
                             srv_popup_height, srv_popup_scroll, c)
                     })
+                } else if overlays_active {
+                    // An overlay (command prompt, rename, chooser, menu, etc.)
+                    // is active. Some overlays (command_input, window_idx_input)
+                    // already set their own cursor position earlier in this
+                    // draw closure — don't override it. Others (rename, menu,
+                    // display_panes) intentionally have no visible cursor.
+                    None
                 } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_rect) {
                     let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
                     let cy = inner.y + cr.min(inner.height.saturating_sub(1));

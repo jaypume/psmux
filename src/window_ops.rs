@@ -1083,12 +1083,18 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         mouse_log("  -> entering copy mode (shell scroll-up)");
         enter_copy_mode(app);
         scroll_copy_up(app, 3);
+    } else if !up && app.scroll_enter_copy_mode {
+        // Scroll-down at shell: enter copy mode and scroll down.
+        mouse_log("  -> entering copy mode (shell scroll-down)");
+        enter_copy_mode(app);
+        scroll_copy_down(app, 3);
+        if app.copy_scroll_offset == 0 && app.copy_anchor.is_none() {
+            exit_copy_mode(app);
+        }
     } else if !app.scroll_enter_copy_mode {
         // scroll-enter-copy-mode off: scroll scrollback directly (#193)
         mouse_log("  -> direct scrollback (scroll-enter-copy-mode off)");
         scroll_pane_scrollback(app, 3, up);
-    } else {
-        mouse_log("  -> scroll-down at shell (no-op)");
     }
 }
 
@@ -1327,6 +1333,14 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         // enter copy mode and scroll psmux's own buffer.
         enter_copy_mode(app);
         scroll_copy_up(app, 3);
+    } else if !up && app.scroll_enter_copy_mode {
+        // Scroll-down at shell: enter copy mode and scroll down.
+        // Auto-exit at the bottom of scrollback.
+        enter_copy_mode(app);
+        scroll_copy_down(app, 3);
+        if app.copy_scroll_offset == 0 && app.copy_anchor.is_none() {
+            exit_copy_mode(app);
+        }
     } else if !app.scroll_enter_copy_mode {
         // scroll-enter-copy-mode off: scroll scrollback directly (#193)
         scroll_pane_scrollback(app, 3, up);
